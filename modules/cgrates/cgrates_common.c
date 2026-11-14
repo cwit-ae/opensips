@@ -614,6 +614,24 @@ static int cgrates_async_resume_repl(int fd,
 	int ret;
 	struct cgr_param *cp = (struct cgr_param *)param;
 	struct cgr_conn *c = cp->c;
+	context_p own_ctx = NULL;
+
+	/* a job started with launch() is resumed by the core without a
+	 * processing context, and the reply is kept in one: give this call a
+	 * context of its own (without it the first read of the context below
+	 * is a NULL dereference: the whole OpenSIPS stops) */
+	if (!current_processing_ctx) {
+		own_ctx = context_alloc(CONTEXT_GLOBAL);
+		if (!own_ctx) {
+			LM_ERR("no more pkg memory for a processing context\n");
+			async_status = ASYNC_DONE_CLOSE_FD;
+			cgrc_close(c, 0);
+			pkg_free(cp);
+			return -2;
+		}
+		memset(own_ctx, 0, context_size(CONTEXT_GLOBAL));
+		current_processing_ctx = own_ctx;
+	}
 
 	/* reset the error */
 	CGR_RESET_REPLY_CTX();
@@ -632,12 +650,19 @@ static int cgrates_async_resume_repl(int fd,
 		}
 		break;
 	case ASYNC_CONTINUE:
-		return 1;
+		ret = 1;
+		goto out;
 	}
 end:
 	/* done with this connection */
 	c->state = CGRC_FREE;
 	pkg_free(cp);
+out:
+	if (own_ctx) {
+		context_destroy(CONTEXT_GLOBAL, own_ctx);
+		context_free(own_ctx);
+		current_processing_ctx = NULL;
+	}
 	return ret;
 }
 
@@ -715,6 +740,7 @@ int cgrc_async_read(struct cgr_conn *c,
 	struct cgr_engine *e = c->engine;
 	int ret = -1; /* if return is 0, we need to continue */
 	int final_ret = ret;
+	int got_reply = 0; /* a reply was among the messages read */
 	char *json_buf;
 
 	LM_DBG("Event on fd %d from %.*s:%d\n", c->fd, e->host.len, e->host.s, e->port);
@@ -753,8 +779,10 @@ reprocess:
 		ret = cgrates_process(jobj, c, f, p);
 		json_object_put(jobj);
 		jobj = NULL;
-		if (ret)
+		if (ret) {
 			final_ret = ret;
+			got_reply = 1;
+		}
 	} else {
 		ret = 0;
 	}
@@ -766,6 +794,10 @@ reprocess:
 #endif
 	if (jerr == json_tokener_continue) {
 		LM_DBG("we need to read more until this is completed\n");
+		/* the reply waited for is in: the rest of the message that follows
+		 * it is read when it arrives (the tokener keeps what it has) */
+		if (got_reply)
+			goto done;
 		async_status = ASYNC_CONTINUE;
 		/* we do not release the context yet */
 		return 1;
@@ -783,12 +815,11 @@ reprocess:
 		LM_DBG("%d more bytes to process in the new request: [%.*s]\n",
 				len, len, json_buf);
 		jobj = json_tokener_parse_ex(c->jtok, json_buf, len);
-		/* ret = 0 means that we are waiting for a reply
-		 * but did not get one yet */
-		if (ret)
-			goto done;
-		else
-			goto reprocess;
+		/* every message read is processed: a request from CGRateS that
+		 * follows the reply in the same read (the order to end a call,
+		 * sent right after the session's start is confirmed) was parsed
+		 * here and dropped unanswered */
+		goto reprocess;
 	}
 	/* all done */
 	json_tokener_reset(c->jtok);
@@ -796,7 +827,7 @@ reprocess:
 	 * that we shold continue reading from this socket, otherwise we will
 	 * wrongfully waiting for a reply
 	 */
-	if (ret == 0 && f) {
+	if (!got_reply && f) {
 		LM_DBG("processed a request - continue waiting for a reply!\n");
 		async_status = ASYNC_CONTINUE;
 		return 1;
