@@ -28,6 +28,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
 
 #include "../../dprint.h"
 #include "../../parser/parse_from.h"
@@ -98,6 +99,22 @@ int is_cdr_enabled=0;
 
 #define was_dlg_cb_used(_mask) (_mask&ACC_DLG_CB_USED)
 
+/* The CDR of a dialog is written once. Two processes may get to it at the
+ * same moment (the one that ends the dialog, and the one that is still
+ * passing its 200 on, see acc_dlg_over_at_answer()): the first to ask
+ * has it. */
+static inline int acc_claim_cdr(acc_ctx_t *ctx)
+{
+	int mine;
+
+	accX_lock(&ctx->lock);
+	mine = !was_dlg_cb_used(ctx->flags);
+	if (mine)
+		set_dlg_cb_used(ctx->flags);
+	accX_unlock(&ctx->lock);
+	return mine;
+}
+
 #define cdr_values_registered(_mask) ((_mask)&ACC_CDR_REGISTERED)
 
 #define acc_ref_unsafe(_ctx, _val) (_ctx)->ref_no += (_val)
@@ -141,6 +158,8 @@ static void acc_dlg_ended(struct dlg_cell *dlg, int type,
 static void acc_dlg_onwrite(struct dlg_cell *dlg, int type,
 		struct dlg_cb_params *_params);
 static void acc_cdr_cb( struct cell* t, int type, struct tmcb_params *ps );
+static void acc_dlg_over_at_answer(struct dlg_cell *dlg, struct sip_msg *req,
+		acc_ctx_t *ctx);
 
 void free_extra_array(extra_value_t* array, int array_len)
 {
@@ -731,11 +750,26 @@ static inline void acc_onreply( struct cell* t, struct sip_msg *req,
 			goto restore;
 		}
 
+		/* The dialog counts as answered since this 200 was taken in hand
+		 * (the dialog module moves it on before the reply is sent), and we
+		 * are only called once the reply is out. Whatever ended the dialog
+		 * in between (a BYE handled by another process, an order to end it,
+		 * its timeout) found nothing of ours to call: the dialog is over and
+		 * its CDR is ours to write, here. */
+		if (dlg->state == DLG_STATE_DELETED) {
+			acc_dlg_over_at_answer(dlg, req, ctx);
+			goto restore;
+		}
+
 		/* register callback for program shutdown or dialog replication
 		 * won't register free function since TERMINATED|EXPIRED callback
 		 * free function will be called to free */
 		if (dlg_api.register_dlgcb(dlg, DLGCB_WRITE_VP,
 					acc_dlg_onwrite, ctx, NULL) != 0) {
+			if (dlg->state == DLG_STATE_DELETED) {
+				acc_dlg_over_at_answer(dlg, req, ctx);
+				goto restore;
+			}
 			LM_ERR("cannot register callback for context serialization\n");
 			goto restore;
 		}
@@ -745,6 +779,10 @@ static inline void acc_onreply( struct cell* t, struct sip_msg *req,
 		if (dlg_api.register_dlgcb(dlg, DLGCB_TERMINATED|DLGCB_EXPIRED,
 								acc_dlg_ended, ctx, unref_acc_ctx) != 0) {
 			acc_unref_ex(ctx, 2);
+			if (dlg->state == DLG_STATE_DELETED) {
+				acc_dlg_over_at_answer(dlg, req, ctx);
+				goto restore;
+			}
 			LM_ERR("cannot register callback for database accounting\n");
 			goto restore;
 		}
@@ -753,9 +791,19 @@ static inline void acc_onreply( struct cell* t, struct sip_msg *req,
 		if (dlg_api.register_dlgcb(dlg, DLGCB_REQ_WITHIN,
 								acc_merge_contexts, ctx, unref_acc_ctx) != 0) {
 			acc_unref(ctx); /* only one, the other one was successful */
-			LM_ERR("cannot register callback ctx management\n");
-			goto restore;
+			if (dlg->state != DLG_STATE_DELETED) {
+				LM_ERR("cannot register callback ctx management\n");
+				goto restore;
+			}
 		}
+
+		/* Callbacks are not registered under a lock: a dialog ended while
+		 * ours were being hooked in may have run its list without them.
+		 * If the dialog is over now and its end was not accounted, it is
+		 * accounted here (acc_dlg_ended() and this take the CDR by
+		 * acc_claim_cdr(), so it is written once either way). */
+		if (dlg->state == DLG_STATE_DELETED)
+			acc_dlg_over_at_answer(dlg, req, ctx);
 
 	} else {
 		/* do old accounting */
@@ -806,12 +854,11 @@ static void acc_dlg_ended(struct dlg_cell *dlg, int type,
 	 * if opensips shuts down before dialog terminated then the refcount
 	 * won't be enabled
 	 */
-	if (was_dlg_cb_used(ctx->flags)) {
+	if (!acc_claim_cdr(ctx)) {
 		LM_INFO("CDR callback already registered [%p|%u] - do not run it again!\n",
 				*_params->param, ctx->ref_no);
 		return;
 	}
-	set_dlg_cb_used(ctx->flags);
 
 	/* this time will be used to set */
 	ctx->bye_time = *get_msg_time(_params->msg);
@@ -863,6 +910,52 @@ static void acc_dlg_ended(struct dlg_cell *dlg, int type,
 		}
 	}
 
+}
+
+
+/* The CDR of a dialog that was ended before its 200 had been sent on, so
+ * before acc_onreply() could ask to be told of its end. It is written now,
+ * with the engines the context asks for, as for a dialog that expired; the
+ * call ended about now. */
+static void acc_dlg_over_at_answer(struct dlg_cell *dlg, struct sip_msg *req,
+		acc_ctx_t *ctx)
+{
+	if (!acc_claim_cdr(ctx))
+		return; /* the dialog's own callback got to it */
+
+	LM_NOTICE("dialog [%.*s] was ended while its 200 was passed on - "
+			"writing its CDR now\n", dlg->callid.len, dlg->callid.s);
+
+	gettimeofday(&ctx->bye_time, NULL);
+
+	if (is_log_acc_on(ctx->flags)) {
+		env_set_text( ACC_ENDED, ACC_ENDED_LEN);
+		if (acc_log_cdrs(dlg, req, ctx) < 0) {
+			LM_ERR("Cannot log values\n");
+			return;
+		}
+	}
+
+	if (is_db_acc_on(ctx->flags)) {
+		env_set_text( db_table_acc.s, db_table_acc.len);
+		if (acc_db_cdrs(dlg, req, ctx) < 0) {
+			LM_ERR("Cannot insert into database\n");
+			return;
+		}
+	}
+
+	if (is_aaa_acc_on(ctx->flags) && acc_aaa_cdrs(dlg, req, ctx) < 0) {
+		LM_ERR("Cannot create radius accounting\n");
+		return;
+	}
+
+	if (is_evi_acc_on(ctx->flags)) {
+		env_set_event(acc_cdr_event, acc_cdr_event_params, evi_cdr_params);
+		if (acc_evi_cdrs(dlg, req, ctx) < 0) {
+			LM_ERR("cannot send accounting events\n");
+			return;
+		}
+	}
 }
 
 
