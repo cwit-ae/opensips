@@ -421,6 +421,39 @@ static void dlg_leg_push_cseq_map(struct dlg_cell *dlg, struct cell *t, unsigned
 }
 
 
+/* A 2xx to an INVITE must carry a Contact (RFC 3261 12.1.2). For one that does
+ * not, the far end is reached where the answer came from: the ACK and every
+ * later request of the call go there, as the answer's sender is the only
+ * address known for it (else no request of the call could reach it, and it
+ * would keep a call the other side has ended). */
+static char src_contact_buf[IP_ADDR_MAX_STR_SIZE + 48];
+
+static inline void contact_from_source(struct sip_msg *msg, str *contact)
+{
+	char *ip;
+	int n;
+
+	ip = ip_addr2a(&msg->rcv.src_ip);
+	if (msg->rcv.proto == PROTO_UDP || msg->rcv.proto == PROTO_NONE)
+		n = snprintf(src_contact_buf, sizeof src_contact_buf,
+			msg->rcv.src_ip.af == AF_INET6 ? "sip:[%s]:%u" : "sip:%s:%u",
+			ip, msg->rcv.src_port);
+	else
+		n = snprintf(src_contact_buf, sizeof src_contact_buf,
+			msg->rcv.src_ip.af == AF_INET6 ? "sip:[%s]:%u;transport=%s" : "sip:%s:%u;transport=%s",
+			ip, msg->rcv.src_port, proto2a(msg->rcv.proto));
+	if (n <= 0 || n >= (int)sizeof src_contact_buf) {
+		contact->s = NULL;
+		contact->len = 0;
+		return;
+	}
+	contact->s = src_contact_buf;
+	contact->len = n;
+	LM_WARN("2xx without Contact from %s:%u (Call-ID %.*s): the call's requests "
+		"go to that address\n", ip, msg->rcv.src_port,
+		msg->callid ? msg->callid->body.len : 0, msg->callid ? msg->callid->body.s : "");
+}
+
 static inline void get_routing_info(struct sip_msg *msg, int is_req,
 							unsigned int *skip_rrs, str *contact, str *rr_set)
 {
@@ -429,6 +462,8 @@ static inline void get_routing_info(struct sip_msg *msg, int is_req,
 		//LM_ERR("bad sip message or missing Contact hdr\n");
 		contact->s = NULL;
 		contact->len = 0;
+		if (!is_req && msg->REPLY_STATUS >= 200 && msg->REPLY_STATUS < 300)
+			contact_from_source(msg, contact);
 	} else {
 		if ( parse_contact(msg->contact)<0 ||
 		((contact_body_t *)msg->contact->parsed)->contacts==NULL ||
