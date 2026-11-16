@@ -396,6 +396,17 @@ static inline int topo_ct_short_len(int len, short *out, const char *field)
 	return 0;
 }
 
+/* a pkg copy of a literal, for a lump (lumps free what they hold) */
+static char *pkg_strdup_hdr(const char *s)
+{
+	int len = strlen(s);
+	char *p = pkg_malloc(len);
+
+	if (p)
+		memcpy(p, s, len);
+	return p;
+}
+
 static int topo_dlg_replace_contact(struct sip_msg* msg, struct dlg_cell* dlg,
 		int leg, str *ct_user)
 {
@@ -409,6 +420,8 @@ static int topo_dlg_replace_contact(struct sip_msg* msg, struct dlg_cell* dlg,
 	struct lump* lump;
 	str *ct;
 
+	int no_ct = 0; /* a 2xx without Contact: ours is added, not put in place of one */
+
 	if(!msg->contact)
 	{
 		if(parse_headers(msg, HDR_CONTACT_F, 0)< 0)
@@ -416,11 +429,23 @@ static int topo_dlg_replace_contact(struct sip_msg* msg, struct dlg_cell* dlg,
 			LM_ERR("Failed to parse headers\n");
 			return -1;
 		}
-		if(!msg->contact)
-			return 0;
+		if(!msg->contact) {
+			/* A 2xx to an INVITE must carry a Contact; without ours the
+			 * other side has no address for the call's later requests (the
+			 * ACK, the BYE), and none of them could be matched to the call */
+			if (msg->first_line.type != SIP_REPLY || msg->REPLY_STATUS < 200 ||
+					msg->REPLY_STATUS >= 300 || !msg->cseq ||
+					get_cseq(msg)->method_id != METHOD_INVITE)
+				return 0;
+			if (parse_headers(msg, HDR_EOH_F, 0) < 0) {
+				LM_ERR("Failed to parse headers\n");
+				return -1;
+			}
+			no_ct = 1;
+		}
 	}
 
-	if (leg >= 0 && dlg->legs[leg].adv_contact.len) {
+	if (!no_ct && leg >= 0 && dlg->legs[leg].adv_contact.len) {
 		ct = &dlg->legs[leg].adv_contact;
 
 		prefix = pkg_malloc(ct->len);
@@ -449,7 +474,7 @@ static int topo_dlg_replace_contact(struct sip_msg* msg, struct dlg_cell* dlg,
 		ct_username = ct_user->s;
 		ct_username_len = ct_user->len;
 		prefix_len += 1 + /* @ */ + ct_username_len;
-	} else if (dlg_api.is_mod_flag_set(dlg,TOPOH_KEEP_USER)) {
+	} else if (!no_ct && dlg_api.is_mod_flag_set(dlg,TOPOH_KEEP_USER)) {
 		if ( parse_contact(msg->contact)<0 ||
 			((contact_body_t *)msg->contact->parsed)->contacts==NULL ||
 			((contact_body_t *)msg->contact->parsed)->contacts->next!=NULL ) {
@@ -484,7 +509,7 @@ static int topo_dlg_replace_contact(struct sip_msg* msg, struct dlg_cell* dlg,
 		suffix_len = 1; /* > */
 	else
 		suffix_len = RR_DLG_PARAM_SIZE+1; /* > */
-	if (th_param_list) {
+	if (!no_ct && th_param_list) {
 		if ( parse_contact(msg->contact)<0 ||
 			((contact_body_t *)msg->contact->parsed)->contacts==NULL ||
 			((contact_body_t *)msg->contact->parsed)->contacts->next!=NULL ) {
@@ -505,7 +530,7 @@ static int topo_dlg_replace_contact(struct sip_msg* msg, struct dlg_cell* dlg,
 		}
 	}
 
-	if (th_hdr_param_list) {
+	if (!no_ct && th_hdr_param_list) {
 		if ( parse_contact(msg->contact)<0 ||
 			((contact_body_t *)msg->contact->parsed)->contacts==NULL ||
 			((contact_body_t *)msg->contact->parsed)->contacts->next!=NULL ) {
@@ -584,7 +609,7 @@ static int topo_dlg_replace_contact(struct sip_msg* msg, struct dlg_cell* dlg,
 			return -1;
 	}
 
-	if (th_param_list) {
+	if (!no_ct && th_param_list) {
 		for (el=th_param_list;el;el=el->next) {
 			/* we just iterate over the unknown params */
 			for (i=0;i<ctu.u_params_no;i++) {
@@ -595,7 +620,7 @@ static int topo_dlg_replace_contact(struct sip_msg* msg, struct dlg_cell* dlg,
 	}
 
 	*p++ = '>';
-	if (th_hdr_param_list) {
+	if (!no_ct && th_hdr_param_list) {
 		if ( parse_contact(msg->contact)<0 ||
 			((contact_body_t *)msg->contact->parsed)->contacts==NULL ||
 			((contact_body_t *)msg->contact->parsed)->contacts->next!=NULL ) {
@@ -611,7 +636,17 @@ static int topo_dlg_replace_contact(struct sip_msg* msg, struct dlg_cell* dlg,
 	}
 	suffix_len = p - p_init;
 
-	if (!(lump = delete_existing_contact(msg, 0))){
+	if (no_ct) {
+		/* a whole header, at the end of the headers */
+		if (!(lump = anchor_lump(msg, msg->unparsed - msg->buf, 0))) {
+			LM_ERR("failed to anchor the Contact header\n");
+			goto error;
+		}
+		if ((lump = insert_new_lump_after(lump, pkg_strdup_hdr("Contact: "), 9, 0)) == 0) {
+			LM_ERR("failed inserting 'Contact: '\n");
+			goto error;
+		}
+	} else if (!(lump = delete_existing_contact(msg, 0))){
 		LM_ERR("Failed removing existing contact \n");
 		goto error;
 	}
@@ -631,6 +666,12 @@ static int topo_dlg_replace_contact(struct sip_msg* msg, struct dlg_cell* dlg,
 	if ((lump = insert_new_lump_after(lump,suffix,suffix_len,0)) == 0) {
 		LM_ERR("failed inserting '<sip:'\n");
 		goto error;
+	}
+	suffix = NULL;
+
+	if (no_ct && insert_new_lump_after(lump, pkg_strdup_hdr(CRLF), CRLF_LEN, 0) == 0) {
+		LM_ERR("failed inserting the end of the Contact header\n");
+		return -1;
 	}
 
 	return 0;
