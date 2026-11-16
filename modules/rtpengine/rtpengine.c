@@ -348,6 +348,7 @@ static int set_rtpengine_set_f(struct sip_msg * msg, rtpe_set_link_t *set_param)
 static int set_rtpengine_set_from_avp(struct sip_msg *msg);
 static struct rtpe_set * select_rtpe_set(int id_set);
 static struct rtpe_node *select_rtpe_node(str, struct rtpe_set *, struct rtpe_ignore_node *);
+static struct rtpe_node *select_rtpe_node_op(str, struct rtpe_set *, struct rtpe_ignore_node *, enum rtpe_operation);
 static struct rtpe_node *lookup_rtpe_node(struct rtpe_set * rtpe_list, str *rtpe_url);
 static void free_rtpe_set(int);
 static void free_rtpe_node(struct rtpe_set *, str *);
@@ -2937,7 +2938,7 @@ static bencode_item_t *rtpe_function_call(bencode_buffer_t *bencbuf, struct sip_
 				node = select_rtpe_node(ng_flags.call_id, set, ignore_list);
 			snode = NULL;
 		} else {
-			node = select_rtpe_node(ng_flags.call_id, set, ignore_list);
+			node = select_rtpe_node_op(ng_flags.call_id, set, ignore_list, op);
 		}
 
 		if (!node) {
@@ -3434,6 +3435,34 @@ select_rtpe_node(str callid, struct rtpe_set *set, struct rtpe_ignore_node *igno
 	return NULL;
 }
 
+/*
+ * The node for a command. An offer starts a session and goes to a node that is
+ * not set aside. Any other command (answer, delete, query, ...) is about a
+ * session a node already holds: it goes to that node even while the node is set
+ * aside after a timeout (rtpengine_disable_tout), or the session is left half
+ * made (an answer that never reaches the node: the caller is told the far
+ * side's own address) or never deleted. A node an operator disabled over MI is
+ * not used. Known for a set of one node, the case of a node per set; a set of
+ * several keeps the plain choice, since the offer's node is not known there.
+ */
+static struct rtpe_node *
+select_rtpe_node_op(str callid, struct rtpe_set *set, struct rtpe_ignore_node *ignore_list,
+		enum rtpe_operation op)
+{
+	struct rtpe_node *node;
+
+	node = select_rtpe_node(callid, set, ignore_list);
+	if (node || op == OP_OFFER || !set || set->rtpe_node_count != 1)
+		return node;
+	node = set->rn_first;
+	if (!node || node->rn_recheck_ticks == MI_MAX_RECHECK_TICKS ||
+			rtpe_is_ignore_node(ignore_list, node))
+		return NULL;
+	LM_DBG("%s for a session on set-aside node %.*s\n", command_strings[op],
+			node->rn_url.len, node->rn_url.s);
+	return node;
+}
+
 static int
 get_extra_id(struct sip_msg* msg, str *id_str) {
 	if(msg==NULL || extra_id_pv==NULL || id_str==NULL) {
@@ -3816,7 +3845,7 @@ static int rtpe_function_call_async(struct sip_msg *msg, async_ctx *ctx, str *fl
 	RTPE_START_READ();
 
 	/* FIXME - failover logic for async is disabled for now */
-	node = select_rtpe_node(ng_flags.call_id, set,NULL);
+	node = select_rtpe_node_op(ng_flags.call_id, set, NULL, op);
 	if (!node) {
 		LM_ERR("no available proxies\n");
 		RTPE_STOP_READ();
