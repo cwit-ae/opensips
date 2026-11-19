@@ -34,7 +34,14 @@ static void cgrc_reconn_rpc(int sender, void *p);
 
 static int cgrc_reconn(struct cgr_conn *c)
 {
-	int ret = cgrc_conn(c);
+	int ret;
+
+	/* a reconnect scheduled when the connection closed: it may have been
+	 * reopened since (when a command needed it), and opening it again would
+	 * replace a socket that is in use */
+	if (c->state != CGRC_CLOSED)
+		return 0;
+	ret = cgrc_conn(c);
 	if (ret >= 0 && c == c->engine->default_con)
 		return cgrc_start_listen(c);
 	return ret;
@@ -51,6 +58,8 @@ static int cgrc_conn_sched(int fd, void *p)
 			c->engine->host.s, c->engine->port);
 	if (cgrc_reconn(c) < 0)
 		cgr_conn_schedule(c);
+	/* the timer is spent: the core closes it (it was never closed) */
+	async_status = ASYNC_DONE_CLOSE_FD;
 	return 1;
 }
 
@@ -122,8 +131,7 @@ struct cgr_conn *cgr_get_free_conn(struct cgr_engine *e)
 		c = list_entry(l, struct cgr_conn, list);
 		if (c->state == CGRC_CLOSED) {
 			if (c->disable_time + cgre_retry_tout < now) {
-				if (tcp_connect_blocking_timeout(c->fd, &c->engine->su.s,
-				        sockaddru_len(c->engine->su), c->connect_timeout)<0){
+				if (cgrc_conn(c) < 0) {
 					LM_INFO("cannot connect to %.*s:%d\n", c->engine->host.len,
 							c->engine->host.s, c->engine->port);
 					c->disable_time = now;
@@ -215,6 +223,7 @@ struct cgr_conn *cgrc_new(struct cgr_engine *e)
 	}
 	c->engine = e;
 	c->state = CGRC_CLOSED;
+	c->fd = -1;
 
 	return c;
 error:
@@ -223,8 +232,15 @@ error:
 }
 
 
+/* release: 1 = the socket is closed here (and taken out of the reactor when
+ * the connection listens on it); 0 = it is the socket the core is serving,
+ * and the core takes it out and closes it (ASYNC_DONE_CLOSE_FD). Either way
+ * the connection forgets it: a closed connection is reopened on a new socket,
+ * never on the old number, which by then may belong to something else. */
 void cgrc_close(struct cgr_conn *c, int release)
 {
+	if (c->state == CGRC_CLOSED && c->fd < 0)
+		return; /* closed already */
 	c->state = CGRC_CLOSED;
 	c->disable_time = time(NULL);
 	/* clean whatever was left in the buffer */
@@ -234,10 +250,13 @@ void cgrc_close(struct cgr_conn *c, int release)
 	 * there is a high chance that the schedule take the same FD, thus it will
 	 * be later on removed from the reactor again */
 	cgr_conn_schedule(c);
-	if (release) {
-		reactor_del_reader(c->fd, -1, IO_FD_CLOSING);
+	if (release && c->fd >= 0) {
+		if (CGRC_IS_LISTEN(c))
+			reactor_del_reader(c->fd, -1, IO_FD_CLOSING);
 		close(c->fd);
 	}
+	CGRC_UNSET_LISTEN(c);
+	c->fd = -1;
 
 	LM_INFO("closing connection %.*s:%hu\n", c->engine->host.len,
 			c->engine->host.s, c->engine->port);
@@ -299,7 +318,7 @@ int cgrc_send(struct cgr_conn *c, str *buf)
 		ret = write(c->fd, buf->s + written, buf->len - written);
 		if (ret <= 0) {
 			if (errno != EINTR) {
-				cgrc_close(c, CGRC_IS_LISTEN(c));
+				cgrc_close(c, 1);
 				return -1;
 			}
 		} else {

@@ -557,12 +557,26 @@ static void _cgr_free_local_ctx(struct cgr_local_ctx *ctx)
  *  -3 - no suitable cgrates server found
  *  -4 - cgrates engaged on invalid message
  */
+/* After a read in sync mode: when the read closed the connection
+ * (ASYNC_DONE_CLOSE_FD), no core function is serving its socket to take it
+ * out of the reactor and close it, so it is done here. Returns 1 then. */
+static int cgrc_sync_closed(int fd, int listening)
+{
+	if (async_status != ASYNC_DONE_CLOSE_FD || fd < 0)
+		return 0;
+	if (listening)
+		reactor_del_reader(fd, -1, IO_FD_CLOSING);
+	close(fd);
+	return 1;
+}
+
 int cgr_handle_cmd(struct sip_msg *msg, json_object *jmsg,
 		cgr_proc_reply_f f, void *p)
 {
 	struct list_head *l;
 	struct cgr_engine *e;
 	struct cgr_conn *c = NULL;
+	int fd, listening;
 	int ret = 1;
 	str smsg;
 
@@ -595,9 +609,12 @@ int cgr_handle_cmd(struct sip_msg *msg, json_object *jmsg,
 		return -3;
 
 	/* message successfully sent - now fetch the reply */
+	fd = c->fd;
+	listening = CGRC_IS_LISTEN(c);
 	do {
 		ret = cgrc_async_read(c, f, p);
 	} while(async_status == ASYNC_CONTINUE);
+	cgrc_sync_closed(fd, listening);
 
 	return ret;
 }
@@ -654,8 +671,11 @@ static int cgrates_async_resume_repl(int fd,
 		goto out;
 	}
 end:
-	/* done with this connection */
-	c->state = CGRC_FREE;
+	/* done with this connection, unless the reply closed it: a closed
+	 * connection handed out as free was written to on a socket number the
+	 * core had closed, and that may belong to something else by then */
+	if (c->state != CGRC_CLOSED)
+		c->state = CGRC_FREE;
 	pkg_free(cp);
 out:
 	if (own_ctx) {
@@ -673,6 +693,7 @@ int cgr_handle_async_cmd(struct sip_msg *msg, json_object *jmsg,
 	struct cgr_engine *e;
 	struct cgr_conn *c;
 	struct cgr_param *cp = NULL;
+	int fd, listening;
 	int ret = 1;
 	str smsg;
 
@@ -702,9 +723,13 @@ int cgr_handle_async_cmd(struct sip_msg *msg, json_object *jmsg,
 		if (CGRC_IS_DEFAULT(c)) {
 			/* reset the error */
 			CGR_RESET_REPLY_CTX();
+			fd = c->fd;
+			listening = CGRC_IS_LISTEN(c);
 			do {
 				ret = cgrc_async_read(c, f, p);
 			} while(async_status == ASYNC_CONTINUE);
+			if (cgrc_sync_closed(fd, listening))
+				async_status = ASYNC_SYNC;
 			if (async_status == ASYNC_DONE)
 				/* do the reading in sync mode */
 				async_status = ASYNC_SYNC;
